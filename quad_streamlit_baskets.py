@@ -3,9 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import platform
+import time
 
 import numpy as np
 import pandas as pd
+import plotly
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -165,6 +168,19 @@ def quad_color(name: str) -> str:
     return QUAD_BASE_COLORS.get(quad_label(name), QUAD_COLORS.get(name, "#555555"))
 
 
+def stretch_kwargs() -> dict[str, object]:
+    """Compatibility wrapper for Streamlit width API across versions."""
+    try:
+        parts = st.__version__.split(".")
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except Exception:
+        major, minor = 0, 0
+    if (major, minor) >= (1, 50):
+        return {"width": "stretch"}
+    return {"use_container_width": True}
+
+
 def periods_per_year(interval: str) -> float:
     mapping = {
         "5m": 78.0 * 252.0,
@@ -305,6 +321,18 @@ def all_symbols(baskets: list[QuadBasket]) -> list[str]:
 
 @st.cache_data(ttl=120)
 def fetch_ohlc(symbols: list[str], period: str, interval: str) -> pd.DataFrame:
+    def _download_one(sym: str) -> pd.DataFrame:
+        return yf.download(
+            sym,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+            prepost=False,
+            group_by="column",
+            threads=False,
+        )
+
     raw = yf.download(
         symbols,
         period=period,
@@ -320,7 +348,45 @@ def fetch_ohlc(symbols: list[str], period: str, interval: str) -> pd.DataFrame:
     if not isinstance(raw.columns, pd.MultiIndex):
         raw.columns = pd.MultiIndex.from_product([raw.columns, symbols[:1]])
     raw = raw.sort_index().dropna(how="all")
+
+    # Retry any missing symbols individually (Yahoo can rate-limit partial baskets).
+    present_syms = set(raw.columns.get_level_values(1))
+    missing = [s for s in symbols if s not in present_syms]
+    for sym in missing:
+        recovered = None
+        for attempt in range(3):
+            try:
+                single = _download_one(sym)
+                if not single.empty:
+                    single.columns = pd.MultiIndex.from_product([single.columns, [sym]])
+                    recovered = single.sort_index().dropna(how="all")
+                    break
+            except Exception:
+                pass
+            time.sleep(0.35 * (attempt + 1))
+        if recovered is not None and not recovered.empty:
+            raw = raw.join(recovered, how="outer")
+    raw = raw.sort_index()
     return raw
+
+
+def missing_or_sparse_symbols(raw: pd.DataFrame, symbols: list[str], min_cov: float = 0.85) -> tuple[list[str], list[str]]:
+    close = _field_frame(raw, "Close")
+    if close.empty:
+        return symbols, []
+
+    missing: list[str] = []
+    sparse: list[str] = []
+    max_bars = max(int(close[s].dropna().size) for s in close.columns) if len(close.columns) else 0
+    for sym in symbols:
+        if sym not in close.columns:
+            missing.append(sym)
+            continue
+        n = int(close[sym].dropna().size)
+        cov = (n / max_bars) if max_bars > 0 else 0.0
+        if cov < min_cov:
+            sparse.append(sym)
+    return missing, sparse
 
 
 @st.cache_data(ttl=120)
@@ -740,10 +806,10 @@ def build_quad_alpha_stats(
     if close.empty:
         return pd.DataFrame()
 
-    ret = close.pct_change().dropna(how="all")
+    ret = close.pct_change(fill_method=None).dropna(how="all")
     bench_ret_full = None
     if benchmark_close is not None and not benchmark_close.empty:
-        bench_ret_full = benchmark_close.sort_index().ffill().pct_change()
+        bench_ret_full = benchmark_close.sort_index().ffill().pct_change(fill_method=None)
 
     rows: list[dict[str, float | str | bool]] = []
     for basket in baskets:
@@ -772,8 +838,8 @@ def build_quad_alpha_stats(
         short_px = close[shorts].mean(axis=1, skipna=True).ffill()
         basis_to_rule = {"Hourly": "1H", "Daily": "1D", "Weekly": "W-FRI"}
         rule = basis_to_rule.get(sig_basis, "W-FRI")
-        basis_long = long_px.resample(rule).last().pct_change().dropna()
-        basis_short = short_px.resample(rule).last().pct_change().dropna()
+        basis_long = long_px.resample(rule).last().pct_change(fill_method=None).dropna()
+        basis_short = short_px.resample(rule).last().pct_change(fill_method=None).dropna()
         basis_spread = (basis_long - basis_short).dropna()
         if basis_spread.size >= 3:
             spread_sig = basis_spread
@@ -840,9 +906,9 @@ def build_cross_quad_significance(
 
     basis_to_rule = {"Hourly": "1H", "Daily": "1D", "Weekly": "W-FRI"}
     rule = basis_to_rule.get(sig_basis, "W-FRI")
-    basis_ret = close_df.resample(rule).last().pct_change().dropna(how="all")
+    basis_ret = close_df.resample(rule).last().pct_change(fill_method=None).dropna(how="all")
     if basis_ret.empty:
-        basis_ret = close_df.pct_change().dropna(how="all")
+        basis_ret = close_df.pct_change(fill_method=None).dropna(how="all")
     basis_ret = basis_ret.fillna(0.0)
 
     totals = ((close_df.iloc[-1] / close_df.iloc[0]) - 1.0) * 100.0
@@ -900,9 +966,9 @@ def build_quad_correlation_matrix(
 
     basis_to_rule = {"Hourly": "1H", "Daily": "1D", "Weekly": "W-FRI"}
     rule = basis_to_rule.get(basis, "W-FRI")
-    ret = close_df.resample(rule).last().pct_change().dropna(how="all")
+    ret = close_df.resample(rule).last().pct_change(fill_method=None).dropna(how="all")
     if ret.empty:
-        ret = close_df.pct_change().dropna(how="all")
+        ret = close_df.pct_change(fill_method=None).dropna(how="all")
     ret = ret.fillna(0.0)
     if ret.empty:
         return pd.DataFrame()
@@ -920,9 +986,9 @@ def build_quad_vs_benchmark_stats(
     basis_to_rule = {"Hourly": "1H", "Daily": "1D", "Weekly": "W-FRI"}
     rule = basis_to_rule.get(basis, "W-FRI")
     bench = benchmark_close.dropna().copy()
-    bench_ret = bench.resample(rule).last().pct_change().dropna()
+    bench_ret = bench.resample(rule).last().pct_change(fill_method=None).dropna()
     if bench_ret.empty:
-        bench_ret = bench.pct_change().dropna()
+        bench_ret = bench.pct_change(fill_method=None).dropna()
     if bench_ret.empty:
         return pd.DataFrame()
 
@@ -931,9 +997,9 @@ def build_quad_vs_benchmark_stats(
         if qdf.empty or "Close" not in qdf.columns:
             continue
         q = qdf["Close"].dropna()
-        q_ret = q.resample(rule).last().pct_change().dropna()
+        q_ret = q.resample(rule).last().pct_change(fill_method=None).dropna()
         if q_ret.empty:
-            q_ret = q.pct_change().dropna()
+            q_ret = q.pct_change(fill_method=None).dropna()
         aligned = pd.concat([q_ret.rename("q"), bench_ret.rename("b")], axis=1).dropna()
         if aligned.empty:
             continue
@@ -1185,6 +1251,7 @@ def plot_components_overlay(
 
 def main() -> None:
     st.set_page_config(page_title="Quad Baskets Candlestick Monitor", layout="wide")
+    stretch_kw = stretch_kwargs()
     st.title("Quad Basket Candlestick Monitor")
     st.caption("Synthetic quad OHLC built from hardwired long-short ETF basket returns.")
 
@@ -1203,9 +1270,11 @@ def main() -> None:
         benchmark_symbol = st.selectbox("Benchmark", ["SPY", "^GSPC"], index=0)
         sig_basis = st.selectbox("Sig Basis", ["Weekly", "Daily", "Hourly"], index=0)
         rth_only = st.checkbox("Regular Trading Hours only", value=True)
+        strict_data = st.checkbox("Strict data completeness", value=True)
         compress_time = st.checkbox("Compress time (remove no-data gaps)", value=True)
         auto_refresh = st.checkbox("Auto refresh", value=False)
         refresh_seconds = st.number_input("Refresh seconds", min_value=5, max_value=300, value=30, step=5)
+        show_diagnostics = st.checkbox("Show diagnostics", value=False)
         do_refresh = st.button("Refresh")
 
     if do_refresh:
@@ -1237,6 +1306,19 @@ def main() -> None:
         st.error("No data returned from Yahoo Finance for this selection.")
         return
 
+    miss, sparse = missing_or_sparse_symbols(raw, symbols, min_cov=0.85)
+    if strict_data and (miss or sparse):
+        problems = []
+        if miss:
+            problems.append(f"missing: {', '.join(miss)}")
+        if sparse:
+            problems.append(f"sparse(<85% bars): {', '.join(sparse)}")
+        st.error(
+            "Incomplete Yahoo data for this run (" + "; ".join(problems) + "). "
+            "Results can diverge vs local/cloud when symbols are partial. Refresh and try again."
+        )
+        return
+
     if rth_only:
         raw = regular_hours_only(raw)
 
@@ -1258,13 +1340,64 @@ def main() -> None:
         st.error("Could not build quad OHLC. Check symbol coverage for selected timeframe.")
         return
 
+    if show_diagnostics:
+        st.subheader("Repro Diagnostics")
+        st.caption("Use this to compare local vs deployed app inputs one-for-one.")
+        env_df = pd.DataFrame(
+            [
+                {"Item": "Python", "Value": platform.python_version()},
+                {"Item": "streamlit", "Value": st.__version__},
+                {"Item": "pandas", "Value": pd.__version__},
+                {"Item": "numpy", "Value": np.__version__},
+                {"Item": "plotly", "Value": getattr(plotly, "__version__", "unknown")},
+                {"Item": "yfinance", "Value": getattr(yf, "__version__", "unknown")},
+                {"Item": "Period", "Value": period},
+                {"Item": "Interval", "Value": interval},
+                {"Item": "RTH only", "Value": str(rth_only)},
+                {"Item": "Compress time", "Value": str(compress_time)},
+                {"Item": "Sig Basis", "Value": sig_basis},
+                {"Item": "Benchmark", "Value": benchmark_symbol},
+            ]
+        )
+        st.dataframe(env_df, hide_index=True, **stretch_kw)
+
+        raw_idx = raw.index
+        raw_meta = {
+            "Raw bars": int(len(raw_idx)),
+            "Raw start": str(raw_idx.min()) if len(raw_idx) else "n/a",
+            "Raw end": str(raw_idx.max()) if len(raw_idx) else "n/a",
+            "Raw timezone": str(raw_idx.tz) if len(raw_idx) else "n/a",
+            "Benchmark bars": int(len(benchmark_close)),
+            "Benchmark start": str(benchmark_close.index.min()) if len(benchmark_close) else "n/a",
+            "Benchmark end": str(benchmark_close.index.max()) if len(benchmark_close) else "n/a",
+        }
+        st.json(raw_meta)
+
+        close_f = _field_frame(raw, "Close")
+        cov_rows: list[dict[str, str | int]] = []
+        for sym in symbols:
+            if sym in close_f.columns:
+                s = close_f[sym].dropna()
+                cov_rows.append(
+                    {
+                        "Symbol": sym,
+                        "Bars": int(s.size),
+                        "Start": str(s.index.min()) if s.size else "n/a",
+                        "End": str(s.index.max()) if s.size else "n/a",
+                    }
+                )
+            else:
+                cov_rows.append({"Symbol": sym, "Bars": 0, "Start": "missing", "End": "missing"})
+        cov_df = pd.DataFrame(cov_rows).sort_values(["Bars", "Symbol"], ascending=[True, True])
+        st.dataframe(cov_df, hide_index=True, **stretch_kw)
+
     st.plotly_chart(
         plot_quad_candles(
             quad_ohlc,
             title=f"Quad Basket Candlesticks ({interval}, {period})",
             compress_time=compress_time,
         ),
-        use_container_width=True,
+        **stretch_kw,
     )
 
     col1, col2 = st.columns([2, 1])
@@ -1275,7 +1408,7 @@ def main() -> None:
                 title="Normalized Close Overlay (Start = 100)",
                 compress_time=compress_time,
             ),
-            use_container_width=True,
+            **stretch_kw,
         )
     with col2:
         snap = build_snapshot_table(quad_ohlc)
@@ -1292,9 +1425,9 @@ def main() -> None:
                         "MoM%": "{:+.2f}%",
                         "Total Period": "{:+.2f}%",
                     }
-                ).applymap(style_signed_cols, subset=["DoD%", "WoW%", "MoM%", "Total Period"]),
-                use_container_width=True,
+                ).map(style_signed_cols, subset=["DoD%", "WoW%", "MoM%", "Total Period"]),
                 hide_index=True,
+                **stretch_kw,
             )
 
     st.subheader("Quad Alpha / Statistical Significance")
@@ -1370,7 +1503,7 @@ def main() -> None:
         perf = perf.sort_values("Total Basket Performance %", ascending=False).reset_index(drop=True)
         st.plotly_chart(
             plot_quad_alpha_bars(perf, y_col="Total Basket Performance %", x_col="Quad"),
-            use_container_width=True,
+            **stretch_kw,
         )
 
         st.dataframe(
@@ -1388,8 +1521,8 @@ def main() -> None:
                     f"Diff vs {benchmark_symbol} p-value": "{:.4f}",
                 }
             ),
-            use_container_width=True,
             hide_index=True,
+            **stretch_kw,
         )
         st.caption(
             f"Benchmark column is based on selected symbol: {benchmark_symbol}. "
@@ -1411,15 +1544,15 @@ def main() -> None:
                         "BasisObs": "{:.0f}",
                     }
                 ),
-                use_container_width=True,
                 hide_index=True,
+                **stretch_kw,
             )
 
         st.subheader("Quad Correlation Heatmap")
         corr = build_quad_correlation_matrix(quad_ohlc=quad_ohlc, basis=sig_basis)
         st.plotly_chart(
             plot_quad_corr_heatmap(corr, title=f"Quad Correlation Matrix ({sig_basis} returns)"),
-            use_container_width=True,
+            **stretch_kw,
         )
 
     st.subheader("Per-Quad Components")
@@ -1444,7 +1577,7 @@ def main() -> None:
                     basket_total=quad_ohlc.get(basket.name),
                     compress_time=compress_time,
                 ),
-                use_container_width=True,
+                **stretch_kw,
             )
 
     st.markdown(
