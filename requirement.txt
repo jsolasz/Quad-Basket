@@ -3,4 +3,4 @@ pandas
 numpy
 plotly
 yfinance
-streamlit-autorefresh>
+streamlit-autorefresh
